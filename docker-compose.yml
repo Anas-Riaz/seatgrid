@@ -1,0 +1,214 @@
+# SeatGrid — every container is one node of the distributed system.
+#
+#   browser ─► gateway (NGINX: load balancer + rate limit, :8080)
+#                 ├─► web   (React UI)
+#                 └─► api x3 (stateless coordinators) ─┬─► redis (cache, holds, lease, rate limits)
+#                                                      ├─► meta  (shard map + 2PC log)
+#                                                      └─► shard1-a/b, shard2-a/b, shard3-a/b
+#                                                          (each shard = primary "a" + streaming replica "b")
+#
+#   docker compose up -d --build                     start everything (seed runs once)
+#   docker compose --profile tools run --rm k6 run /tests/flash-sale.js
+#
+#   Database ports on localhost (for psql / VS Code): meta 5500,
+#   shard N primary 55N1, shard N replica 55N2 (e.g. shard1-a = 5511, shard1-b = 5512)
+
+x-postgres-env: &postgres-env
+  POSTGRES_USER: ${POSTGRES_USER:-postgres}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+  REPLICATION_PASSWORD: ${REPLICATION_PASSWORD:-replicator}
+
+# Settings shared by every shard node. max_prepared_transactions enables 2PC;
+# a replica must allow at least as many as its primary.
+x-postgres-flags: &postgres-flags
+  - -c
+  - max_connections=200
+  - -c
+  - max_prepared_transactions=100
+  - -c
+  - wal_level=replica
+  - -c
+  - max_wal_senders=10
+  - -c
+  - wal_keep_size=512MB
+  - -c
+  - hot_standby=on
+  # Empty = asynchronous replication. Set SYNC_STANDBY_NAMES='*' for the sync-vs-async study.
+  - -c
+  - synchronous_standby_names=${SYNC_STANDBY_NAMES:-}
+
+x-shard-primary: &shard-primary
+  image: postgres:16-alpine
+  environment:
+    <<: *postgres-env
+    POSTGRES_DB: seatgrid
+  command: *postgres-flags
+  healthcheck:
+    # TCP check: only passes after initialisation has finished and the real server is up.
+    test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres"]
+    interval: 3s
+    retries: 30
+  restart: unless-stopped
+
+x-shard-replica: &shard-replica
+  image: postgres:16-alpine
+  user: postgres
+  environment:
+    <<: *postgres-env
+  entrypoint: ["bash", "/scripts/replica-entrypoint.sh"]
+  command: *postgres-flags
+  healthcheck:
+    test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres"]
+    interval: 3s
+    retries: 30
+  restart: unless-stopped
+
+services:
+  # ---------------------------------------------------------------- data tier
+  shard1-a:
+    <<: *shard-primary
+    container_name: shard1-a
+    ports: ["5511:5432"]
+    volumes:
+      - ./infra/postgres/primary-init.sh:/docker-entrypoint-initdb.d/01-replication.sh:ro
+      - ./infra/postgres/shard-schema.sql:/docker-entrypoint-initdb.d/02-schema.sql:ro
+      - shard1-a:/var/lib/postgresql/data
+  shard1-b:
+    <<: *shard-replica
+    container_name: shard1-b
+    ports: ["5512:5432"]
+    environment: { <<: *postgres-env, PRIMARY_HOST: shard1-a }
+    volumes:
+      - ./infra/postgres/replica-entrypoint.sh:/scripts/replica-entrypoint.sh:ro
+      - shard1-b:/var/lib/postgresql/data
+    depends_on: { shard1-a: { condition: service_healthy } }
+
+  shard2-a:
+    <<: *shard-primary
+    container_name: shard2-a
+    ports: ["5521:5432"]
+    volumes:
+      - ./infra/postgres/primary-init.sh:/docker-entrypoint-initdb.d/01-replication.sh:ro
+      - ./infra/postgres/shard-schema.sql:/docker-entrypoint-initdb.d/02-schema.sql:ro
+      - shard2-a:/var/lib/postgresql/data
+  shard2-b:
+    <<: *shard-replica
+    container_name: shard2-b
+    ports: ["5522:5432"]
+    environment: { <<: *postgres-env, PRIMARY_HOST: shard2-a }
+    volumes:
+      - ./infra/postgres/replica-entrypoint.sh:/scripts/replica-entrypoint.sh:ro
+      - shard2-b:/var/lib/postgresql/data
+    depends_on: { shard2-a: { condition: service_healthy } }
+
+  shard3-a:
+    <<: *shard-primary
+    container_name: shard3-a
+    ports: ["5531:5432"]
+    volumes:
+      - ./infra/postgres/primary-init.sh:/docker-entrypoint-initdb.d/01-replication.sh:ro
+      - ./infra/postgres/shard-schema.sql:/docker-entrypoint-initdb.d/02-schema.sql:ro
+      - shard3-a:/var/lib/postgresql/data
+  shard3-b:
+    <<: *shard-replica
+    container_name: shard3-b
+    ports: ["5532:5432"]
+    environment: { <<: *postgres-env, PRIMARY_HOST: shard3-a }
+    volumes:
+      - ./infra/postgres/replica-entrypoint.sh:/scripts/replica-entrypoint.sh:ro
+      - shard3-b:/var/lib/postgresql/data
+    depends_on: { shard3-a: { condition: service_healthy } }
+
+  meta:
+    image: postgres:16-alpine
+    container_name: meta
+    ports: ["5500:5432"]
+    environment:
+      <<: *postgres-env
+      POSTGRES_DB: meta
+    volumes:
+      - ./infra/postgres/meta-schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - meta:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres"]
+      interval: 3s
+      retries: 30
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      retries: 20
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------- one-shot seed job
+  seed:
+    build: ./api
+    container_name: seed
+    command: ["node", "dist/seed/index.js"]
+    environment: &api-env
+      META_DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@meta:5432/meta
+      SHARD_DB_USER: ${POSTGRES_USER:-postgres}
+      SHARD_DB_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      REDIS_URL: redis://redis:6379
+      AUTH_SECRET: ${AUTH_SECRET:-change-me-in-production}
+      SHARD_COUNT: ${SHARD_COUNT:-3}
+      SEED_USERS: ${SEED_USERS:-1000000}
+      SEED_EVENTS: ${SEED_EVENTS:-100}
+      SEATS_PER_SECTION: ${SEATS_PER_SECTION:-1000}
+      # Lets a demo request kill its coordinator mid-2PC (header X-Crash-After). Dev only.
+      CRASH_INJECTION: ${CRASH_INJECTION:-on}
+    depends_on:
+      shard1-b: { condition: service_healthy }
+      shard2-b: { condition: service_healthy }
+      shard3-b: { condition: service_healthy }
+      meta:     { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    restart: "no"
+
+  # ---------------------------------------------------------------- coordinator tier
+  api:
+    build: ./api
+    deploy:
+      replicas: ${API_REPLICAS:-3}
+    environment: *api-env
+    depends_on:
+      seed: { condition: service_completed_successfully }
+    restart: unless-stopped
+
+  web:
+    build: ./web
+    container_name: web
+    restart: unless-stopped
+
+  gateway:
+    image: nginx:1.27-alpine
+    container_name: gateway
+    ports: ["8080:80"]
+    volumes:
+      - ./infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on: [api, web]
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------- load tests (on demand)
+  k6:
+    image: grafana/k6:latest
+    profiles: ["tools"]
+    environment:
+      BASE_URL: http://gateway
+    volumes:
+      - ./tests/k6:/tests:ro
+    depends_on: [gateway]
+
+volumes:
+  shard1-a:
+  shard1-b:
+  shard2-a:
+  shard2-b:
+  shard3-a:
+  shard3-b:
+  meta:

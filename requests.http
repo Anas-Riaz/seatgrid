@@ -1,0 +1,98 @@
+### SeatGrid API examples — click "Send Request" (VS Code REST Client extension)
+@base = http://localhost:8080
+
+### Health: which coordinator answered, is it the leader? (send several times)
+GET {{base}}/health
+
+### Cluster: shard map, replication lag, circuit breakers, leader
+GET {{base}}/api/cluster
+
+### Text search + filters + sort (served by ONE replica; availability from Redis)
+GET {{base}}/api/events?q=karachi&maxPrice=2500&sort=availability&order=desc
+
+### Partial-word search (trigram index)
+GET {{base}}/api/events?q=qalan&sort=price
+
+### One match: free seats per section (scatter-gather over every shard)
+GET {{base}}/api/events/1
+
+### Live seat map of one section (Redis bitmap)
+GET {{base}}/api/events/1/sections/5/seats
+
+### Is a username free? (Ring B -> one owner shard, constant time)
+GET {{base}}/api/auth/username-available?username=demo
+
+### Register
+POST {{base}}/api/auth/register
+Content-Type: application/json
+
+{ "username": "fan_one", "email": "fan@example.com", "password": "password123" }
+
+### Log in (seeded users: demo, admin, user0000001 ... — password "password123")
+# @name login
+POST {{base}}/api/auth/login
+Content-Type: application/json
+
+{ "username": "demo", "password": "password123" }
+
+###
+@token = {{login.response.body.token}}
+
+### My profile and wallet
+GET {{base}}/api/me
+Authorization: Bearer {{token}}
+
+### Step 1a: hold specific seats (send twice: the second gets 409 "Seat already taken")
+# @name hold
+POST {{base}}/api/holds
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "eventId": 1, "sectionId": 5, "seatNos": [10, 11] }
+
+### Step 1b: or hold the best available N seats (SKIP LOCKED)
+POST {{base}}/api/holds
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "eventId": 1, "sectionId": 12, "quantity": 3 }
+
+### Step 2: pay (2PC: seat shard + user shard). Send twice: same key -> same tickets, no double charge.
+POST {{base}}/api/bookings
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "eventId": 1, "sectionId": 5, "holdId": "{{hold.response.body.holdId}}", "idempotencyKey": "demo-order-0001" }
+
+### My tickets (user_tickets index on my own shard)
+GET {{base}}/api/me/tickets
+Authorization: Bearer {{token}}
+
+### Ticket lookup: the number encodes event + section -> routed straight to one shard
+GET {{base}}/api/tickets/E001-S05-0010-ABCD
+
+### ---------------- Admin (log in as "admin") ----------------
+# @name adminLogin
+POST {{base}}/api/auth/login
+Content-Type: application/json
+
+{ "username": "admin", "password": "password123" }
+
+###
+@admin = {{adminLogin.response.body.token}}
+
+### Sales per match and class (partial SUM/COUNT per shard, merged)
+GET {{base}}/api/admin/sales
+Authorization: Bearer {{admin}}
+
+### Bookings by username prefix across all shards (top-K per shard + K-way merge, keyset paging)
+GET {{base}}/api/admin/bookings?username=demo&limit=10
+Authorization: Bearer {{admin}}
+
+### Consistency verifier
+GET {{base}}/api/admin/verify
+Authorization: Bearer {{admin}}
+
+### 2PC log + prepared transactions on each shard
+GET {{base}}/api/admin/transactions
+Authorization: Bearer {{admin}}
